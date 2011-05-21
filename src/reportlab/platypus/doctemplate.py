@@ -866,10 +866,11 @@ class BaseDocTemplate:
         #pagecatcher can drag in information from embedded PDFs and we want ours
         #to take priority, so cache and reapply our own info dictionary after the build.
         self._savedInfo = self.canv._doc.info
-
+        self.cav._doctemplate = self
         setattr(self, 'BUILD_STARTED', 1)
 
     def endBuild(self):
+        del self.canv._doctemplate
         #reapply pagecatcher info
         self.canv._doc.info = self._savedInfo
 
@@ -893,12 +894,8 @@ class BaseDocTemplate:
 
         handled = 0
         canv = self.canv
-        try:
-            canv._doctemplate = self
-            for first in flowables:
-                handled = self.buildFlowable(first, handled)
-        finally:
-            del canv._doctemplate
+        for first in flowables:
+            handled = self.buildFlowable(first, handled)
 
         self.endBuild()
 
