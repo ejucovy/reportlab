@@ -288,11 +288,11 @@ class PageTemplate:
         this page."""
         pass
 
-def _addGeneratedContent(flowables,frame):
+def _addGeneratedContent(frame):
     S = getattr(frame,'_generated_content',None)
-    if S: 
-        flowables[0:0] = S
+    if S:
         del frame._generated_content
+        return S
 
 
 class onDrawStr(str):
@@ -506,8 +506,12 @@ class BaseDocTemplate:
 
     def clean_hanging(self):
         'handle internal postponed actions'
-        while len(self._hanging):
-            self.handle_flowable(self._hanging)
+        for flowable in self._hanging:
+            handle = self.handle_flowable(flowable)
+            if handle:
+                for flowable in handle:
+                    self.handle_flowable(handle)
+        self._hanging = []
 
     def addPageTemplates(self,pageTemplates):
         'add one or a sequence of pageTemplates'
@@ -676,9 +680,8 @@ class BaseDocTemplate:
         self.handle_nextFrame(fx,resume)
         self.handle_frameEnd(resume)
 
-    def handle_breakBefore(self, flowables):
+    def handle_breakBefore(self, first):
         '''preprocessing step to allow pageBreakBefore and frameBreakBefore attributes'''
-        first = flowables[0]
         # if we insert a page break before, we'll process that, see it again,
         # and go in an infinite loop.  So we need to set a flag on the object
         # saying 'skip me'.  This should be unset on the next pass
@@ -693,16 +696,13 @@ class BaseDocTemplate:
             return
         if hasattr(first,'style') and hasattr(first.style, 'pageBreakBefore') and first.style.pageBreakBefore == 1:
             first._skipMeNextTime = 1
-            flowables.insert(0, PageBreak())
-            return
+            return PageBreak()
         if hasattr(first,'frameBreakBefore') and first.frameBreakBefore == 1:
             first._skipMeNextTime = 1
-            flowables.insert(0, FrameBreak())
-            return
+            return FrameBreak()
         if hasattr(first,'style') and hasattr(first.style, 'frameBreakBefore') and first.style.frameBreakBefore == 1:
             first._skipMeNextTime = 1
-            flowables.insert(0, FrameBreak())
-            return
+            return FrameBreak()
 
     def handle_keepWithNext(self, flowables):
         "implements keepWithNext"
@@ -733,17 +733,22 @@ class BaseDocTemplate:
         finally:
             if frame: del f._frame
 
-    def handle_flowable(self,flowables):
+    def handle_flowable(self, f):
         '''try to handle one flowable from the front of list flowables.'''
 
         #allow document a chance to look at, modify or ignore
         #the object(s) about to be processed
-        self.filterFlowables(flowables)
+        # @@@FORKNOTE: disabled, but it's trivial
+        #self.filterFlowables(flowables)
 
-        self.handle_breakBefore(flowables)
-        self.handle_keepWithNext(flowables)
-        f = flowables[0]
-        del flowables[0]
+        breakBefore = self.handle_breakBefore(f)
+        # @@@FORKNOTE: I disabled option keepWithNext, which is unused by default; 
+        # it must be specified by the reportlab user anyway, and I haven't done so.
+        # self.handle_keepWithNext(flowables)
+
+        if breakBefore is not None:
+            self.handle_flowable(breakBefore)
+
         if f is None:
             return
 
@@ -764,7 +769,7 @@ class BaseDocTemplate:
                 if not isinstance(f,FrameActionFlowable):
                     self._curPageFlowableCount += 1
                     self.afterFlowable(f)
-                _addGeneratedContent(flowables,frame)
+                return _addGeneratedContent(frame)
             else:
                 if self.allowSplitting:
                     # see if this is a splittable thing
@@ -780,10 +785,13 @@ class BaseDocTemplate:
                             raise LayoutError(ident)
                         self._curPageFlowableCount += 1
                         self.afterFlowable(S[0])
-                        flowables[0:0] = S[1:]  # put rest of splitted flowables back on the list
-                        _addGeneratedContent(flowables,frame)
+                        # put rest of splitted flowables back on the list after generated content
+                        prepended = _addGeneratedContent(frame) or []
+                        prepended.extend(S[1:])
+                        return prepended
                     else:
-                        flowables[0:0] = S  # put splitted flowables back on the list
+                        # put splitted flowables back on the list
+                        return S
                 else:
                     if hasattr(f,'_postponed'):
                         ident = "Flowable %s%s too large on page %d in frame %r%s of template %r" % \
@@ -796,8 +804,9 @@ class BaseDocTemplate:
                     mbe = getattr(self,'_multiBuildEdits',None)
                     if mbe:
                         mbe((delattr,f,'_postponed'))
-                    flowables.insert(0,f)           # put the flowable back
+                    # put the flowable back
                     self.handle_frameEnd()
+                    return [f]
 
     #these are provided so that deriving classes can refer to them
     _handle_documentBegin = handle_documentBegin
@@ -848,7 +857,29 @@ class BaseDocTemplate:
         if getattr(self,'_doSave',1): self.canv.save()
         if self._onPage: self.canv.setPageCallBack(None)
 
-    def build(self, flowables, filename=None, canvasmaker=canvas.Canvas):
+    def startBuild(self, filename=None, canvasmaker=canvas.Canvas, flowableCount=None):
+        if self._onProgress:
+            self._onProgress('STARTED',0)
+            self._onProgress('SIZE_EST', flowableCount)
+        self._startBuild(filename,canvasmaker)
+
+        #pagecatcher can drag in information from embedded PDFs and we want ours
+        #to take priority, so cache and reapply our own info dictionary after the build.
+        self._savedInfo = self.canv._doc.info
+
+        setattr(self, 'BUILD_STARTED', 1)
+
+    def endBuild(self):
+        #reapply pagecatcher info
+        self.canv._doc.info = self._savedInfo
+
+        self._endBuild()
+        if self._onProgress:
+            self._onProgress('FINISHED',0)
+        
+        delattr(self, 'BUILD_STARTED')
+
+    def build(self, flowables, filename=None, canvasmaker=canvas.Canvas, flowableCount=None):
         """Build the document from a list of flowables.
            If the filename argument is provided then that filename is used
            rather than the one provided upon initialization.
@@ -858,54 +889,45 @@ class BaseDocTemplate:
            doing translations, scalings and redefining the page break
            operations).
         """
-        #assert filter(lambda x: not isinstance(x,Flowable), flowables)==[], "flowables argument error"
-        flowableCount = len(flowables)
-        if self._onProgress:
-            self._onProgress('STARTED',0)
-            self._onProgress('SIZE_EST', len(flowables))
-        self._startBuild(filename,canvasmaker)
+        self.startBuild(filename, canvasmaker, flowableCount)
 
-        #pagecatcher can drag in information from embedded PDFs and we want ours
-        #to take priority, so cache and reapply our own info dictionary after the build.
-        canv = self.canv
-        self._savedInfo = canv._doc.info
         handled = 0
-
+        canv = self.canv
         try:
             canv._doctemplate = self
-            while len(flowables):
-                self.clean_hanging()
-                try:
-                    first = flowables[0]
-                    self.handle_flowable(flowables)
-                    handled += 1
-                except:
-                    #if it has trace info, add it to the traceback message.
-                    if hasattr(first, '_traceInfo') and first._traceInfo:
-                        exc = sys.exc_info()[1]
-                        args = list(exc.args)
-                        tr = first._traceInfo
-                        args[0] += '\n(srcFile %s, line %d char %d to line %d char %d)' % (
-                            tr.srcFile,
-                            tr.startLineNo,
-                            tr.startLinePos,
-                            tr.endLineNo,
-                            tr.endLinePos
-                            )
-                        exc.args = tuple(args)
-                    raise
-                if self._onProgress:
-                    self._onProgress('PROGRESS',flowableCount - len(flowables))
+            for first in flowables:
+                handled = self.buildFlowable(first, handled)
         finally:
             del canv._doctemplate
 
+        self.endBuild()
 
-        #reapply pagecatcher info
-        canv._doc.info = self._savedInfo
-
-        self._endBuild()
+    def buildFlowable(self, first, handled):
+        self.clean_hanging()
+        try:
+            prepend = self.handle_flowable(first)
+            handled += 1
+            if prepend:
+                for flowable in prepend:
+                    handled = self.buildFlowable(flowable, handled)
+        except:
+            #if it has trace info, add it to the traceback message.
+            if hasattr(first, '_traceInfo') and first._traceInfo:
+                exc = sys.exc_info()[1]
+                args = list(exc.args)
+                tr = first._traceInfo
+                args[0] += '\n(srcFile %s, line %d char %d to line %d char %d)' % (
+                    tr.srcFile,
+                    tr.startLineNo,
+                    tr.startLinePos,
+                    tr.endLineNo,
+                    tr.endLinePos
+                    )
+                exc.args = tuple(args)
+            raise
         if self._onProgress:
-            self._onProgress('FINISHED',0)
+            self._onProgress('PROGRESS', handled)
+        return handled
 
     def _allSatisfied(self):
         """Called by multi-build - are all cross-references resolved?"""
